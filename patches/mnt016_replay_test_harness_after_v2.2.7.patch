@@ -1,0 +1,87 @@
+--- Helper_v2.2.7_ledger_hardening.txt
++++ Helper_v2.2.7_with_next_replay_test.js
+@@ -5479,28 +5479,72 @@
+   return result;
+ }
+ 
+-/** Replay test confirms no duplicate runtime publication or audit activity. */
++/**
++ * Replay test for the most recent successful MNT016 operation.
++ *
++ * Unlike the older harness, this does not require another cycle to remain in
++ * `Committed — Awaiting Rebuild` after `testMnt016Api()` has already consumed
++ * it. Instead it finds the latest successful MNT016 Audit Log entry and
++ * resubmits that exact operation identity twice. Because idempotency is checked
++ * before cycle eligibility, both requests must replay without republishing or
++ * duplicating audit evidence.
++ */
+ function testMnt016Replay() {
+   const url = requireText_(getScriptProperty_('WEB_APP_URL', true), 'WEB_APP_URL');
+   const secret = requireText_(getScriptProperty_('HELPER_SECRET', true), 'HELPER_SECRET');
+-  const cycleId = latestMnt016EligibleCycleId_(false);
+-  const suffix = Utilities.formatDate(new Date(), Session.getScriptTimeZone() || NW.TIMEZONE,
+-    'yyyyMMdd-HHmmss') + '-' + Utilities.getUuid().slice(0, 8);
+-  const operationId = 'TEST-MNT016-REPLAY-' + suffix;
++  const prior = latestSuccessfulMnt016Operation_();
+   const payload = {
+-    action: 'rebuild_dynamic_runtime_views', operationId: operationId,
+-    idempotencyKey: operationId, sourceCycleId: cycleId, secret: secret
++    action: 'rebuild_dynamic_runtime_views',
++    operationId: prior.operationId,
++    idempotencyKey: prior.operationId,
++    sourceCycleId: prior.cycleId,
++    secret: secret
+   };
+-  const first = postHelperTestRequest_(url, payload, 'MNT016 replay first request');
+-  assertMnt016Result_(first);
++
+   const ss = openRepository_();
+-  const before = countTableRowsContaining_(ss, NW.AUDIT_LOG, 'Details', 'Operation ID: ' + operationId);
++  const before = countTableRowsContaining_(ss, NW.AUDIT_LOG, 'Details',
++    'Operation ID: ' + prior.operationId);
++  const first = postHelperTestRequest_(url, payload, 'MNT016 replay first request');
++  const middle = countTableRowsContaining_(ss, NW.AUDIT_LOG, 'Details',
++    'Operation ID: ' + prior.operationId);
+   const second = postHelperTestRequest_(url, payload, 'MNT016 replay second request');
+-  const after = countTableRowsContaining_(ss, NW.AUDIT_LOG, 'Details', 'Operation ID: ' + operationId);
+-  if (!second.replayed) throw new Error('Second MNT016 request did not report replayed=true');
+-  if (before !== after) throw new Error('MNT016 replay duplicated audit rows');
++  const after = countTableRowsContaining_(ss, NW.AUDIT_LOG, 'Details',
++    'Operation ID: ' + prior.operationId);
++
++  if (!first.replayed || !second.replayed) {
++    throw new Error('MNT016 replay requests did not both report replayed=true');
++  }
++  if (before !== middle || middle !== after) {
++    throw new Error('MNT016 replay duplicated audit rows: before=' + before +
++      ', middle=' + middle + ', after=' + after);
++  }
+   console.log('✅ MNT016 replay test PASSED');
+-  return {ok: true, first: first, second: second, auditsBefore: before, auditsAfter: after};
++  return {
++    ok: true,
++    helperVersion: NW.VERSION,
++    operationId: prior.operationId,
++    cycleId: prior.cycleId,
++    first: first,
++    second: second,
++    auditsBefore: before,
++    auditsAfter: after
++  };
++}
++
++function latestSuccessfulMnt016Operation_() {
++  const ss = openRepository_();
++  const audits = table_(ss, NW.AUDIT_LOG).rows;
++  for (let i = audits.length - 1; i >= 0; i--) {
++    const row = audits[i] || {};
++    if (String(row.Action || '') !== 'MNT016 runtime rebuild and verification') continue;
++    const details = String(row.Details || '');
++    if (details.indexOf('Success: True') < 0) continue;
++    const match = details.match(/Operation ID:\s*([^|]+)/);
++    const operationId = match ? String(match[1] || '').trim() : '';
++    const cycleId = String(row['Object ID'] || '').trim();
++    if (operationId && cycleId) return {operationId: operationId, cycleId: cycleId};
++  }
++  throw new Error('No successful MNT016 Audit Log entry found for replay test');
+ }
